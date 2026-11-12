@@ -32,6 +32,34 @@ class Settings:
     api_key: str = _env("TIJORI_API_KEY", "")
     audit_retention_days: int = int(_env("TIJORI_AUDIT_RETENTION_DAYS", "365"))
 
+    # On-device intake (UI process only; the gateway never loads this model).
+    translate_model: str = _env(
+        "TIJORI_TRANSLATE_MODEL", "facebook/nllb-200-distilled-600M"
+    )
+    translate_enabled: bool = _env("TIJORI_TRANSLATE_ENABLED", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def get_translate_model() -> str:
+    """Read the NLLB model id dynamically so tests can override it."""
+
+    return _env("TIJORI_TRANSLATE_MODEL", settings.translate_model)
+
+
+def get_translate_enabled() -> bool:
+    """Read the kill switch dynamically (TIJORI_TRANSLATE_ENABLED=0)."""
+
+    return _env("TIJORI_TRANSLATE_ENABLED", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
 
 def get_api_key() -> str:
     """Read API key dynamically so an unset variable disables authentication.

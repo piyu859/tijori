@@ -165,6 +165,9 @@ class SanitizeRequest(BaseModel):
     text: str = Field(min_length=1, max_length=100_000)
     doc_type: str = "other"
     purpose: str = "general"
+    #: Language of the original document. The gateway always receives English
+    #: text; this is audit metadata, not a request for native-language output.
+    source_lang: str = "en"
 
 
 class MaskedEntityView(BaseModel):
@@ -222,6 +225,7 @@ class AuditRecord(BaseModel):
     created_at: str
     doc_type: str = "other"
     purpose: str = "general"
+    source_lang: str = "en"
     task: str = "sanitize"
     entity_counts: dict[str, int] = Field(default_factory=dict)
     outbound_payload: str = ""

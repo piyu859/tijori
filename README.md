@@ -45,13 +45,19 @@ document ──► detect ──► mask ──► forward sanitized ──► r
   records; no document text is ever logged.
 - **Demo UI** — Streamlit three-pane view (input, outbound payload, final
   response) with a custom instruction field and an audit browser.
+- **Multilingual intake** — upload txt, md, csv, docx, pdf or a scanned image;
+  OCR and script detection run locally, and Tamil, Telugu, Kannada, Malayalam,
+  Hindi, Marathi, Bengali, Gujarati, Punjabi or Odia text is translated to
+  English on-device with NLLB-200 before the unchanged gateway runs. A
+  native-script upload is refused if translation is unavailable. See
+  `docs/INGEST.md`.
 - **Evaluation** — 50-document labelled dataset (English and Hindi-English),
   precision/recall, leakage sweep, reinsertion accuracy and latency baseline.
 
 ## Stack
 
 Python 3.10+ (verified on 3.14) · FastAPI · Streamlit · SQLite · Microsoft
-Presidio · GLiNER · spaCy · Ollama (`qwen2.5:3b`).
+Presidio · GLiNER · spaCy · Ollama (`qwen2.5:3b`) · NLLB-200 (on-device intake).
 
 ## Quickstart
 
@@ -91,6 +97,8 @@ key and retention window, which are re-read per request).
 | `TIJORI_LOG_LEVEL` | `INFO` | Log verbosity |
 | `TIJORI_API_KEY` | *(empty)* | Enables `X-API-Key` auth on `/v1/*` |
 | `TIJORI_AUDIT_RETENTION_DAYS` | `365` | Audit retention window |
+| `TIJORI_TRANSLATE_MODEL` | `facebook/nllb-200-distilled-600M` | On-device NLLB model for uploads |
+| `TIJORI_TRANSLATE_ENABLED` | `1` | Set `0` to refuse native-script uploads |
 
 To use an external provider, change only the three `TIJORI_LLM_*` values and
 keep the adapter unchanged.
@@ -130,6 +138,17 @@ uvicorn app.main:app --port 8000
 # shell 3 — UI
 streamlit run ui/app.py
 ```
+
+### Uploading documents
+
+Use **Upload document** in the sidebar to load a `.txt`, `.md`, `.csv`, `.docx`,
+`.pdf`, `.png`, `.jpg`, `.jpeg`, `.tif` or `.tiff` file. Extraction and OCR run
+locally; Indic text is translated to English on-device with NLLB-200 and placed
+in the editable document box. The language badge (`Tamil → English, on-device`)
+and an expander with the native original, page count and OCR metadata show what
+happened. If translation fails, **Run gateway** is disabled rather than sending
+un-translated native-script text to the gateway. Limits and install notes are in
+`docs/INGEST.md`.
 
 Load a sample, edit the instruction, and run. The default sample `loan_001`
 should return three bullets with all ten placeholders restored (Replaced 10,
@@ -202,6 +221,7 @@ endpoint is reachable.
 | `privacy/` | Detection, masking, vault, reinsertion |
 | `app/` | FastAPI routes, pipeline, provider, audit, configuration |
 | `ui/` | Streamlit demo |
+| `ingest/` | On-device extraction, script detection and NLLB translation |
 | `evaluation/` | Dataset replay and metrics report |
 | `data/` | Labelled dataset and local audit database |
 | `reports/` | Generated evaluation report |
@@ -211,6 +231,9 @@ endpoint is reachable.
 
 - Detection is tuned for Indian documents and English/Hindi-English text; the
   taxonomy does not yet include vehicle registration numbers.
+- Multilingual intake translates native scripts to English before detection;
+  romanised Indic text (`vanakkam`, `mera naam`) is classified as English and is
+  not translated. Native-language answers are out of scope.
 - Reinsertion is exact-token: if the model rewrites a placeholder, it is
   reported as `unknown` rather than repaired.
 - Purpose-based policies are recorded (`purpose` on each request) but not

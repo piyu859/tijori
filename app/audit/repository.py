@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS audit_requests (
     created_at           TEXT NOT NULL,
     doc_type             TEXT NOT NULL,
     purpose              TEXT NOT NULL,
+    source_lang          TEXT NOT NULL DEFAULT 'en',
     task                 TEXT NOT NULL,
     entity_counts        TEXT NOT NULL,
     outbound_payload     TEXT NOT NULL,
@@ -42,6 +43,7 @@ _COLUMNS = (
     "created_at",
     "doc_type",
     "purpose",
+    "source_lang",
     "task",
     "entity_counts",
     "outbound_payload",
@@ -80,7 +82,18 @@ class AuditRepository:
         with closing(self._connect()) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(_SCHEMA)
+            self._migrate(conn)
             conn.commit()
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Additive migrations for databases created before this column existed."""
+
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(audit_requests)")}
+        if "source_lang" not in columns:
+            conn.execute(
+                "ALTER TABLE audit_requests ADD COLUMN source_lang TEXT NOT NULL DEFAULT 'en'"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10)
@@ -94,6 +107,7 @@ class AuditRepository:
             record.created_at,
             record.doc_type,
             record.purpose,
+            record.source_lang,
             record.task,
             _dumps(record.entity_counts),
             record.outbound_payload,
@@ -168,6 +182,7 @@ class AuditRepository:
             created_at=row["created_at"],
             doc_type=row["doc_type"],
             purpose=row["purpose"],
+            source_lang=row["source_lang"],
             task=row["task"],
             entity_counts=_loads(row["entity_counts"], {}),
             outbound_payload=row["outbound_payload"],

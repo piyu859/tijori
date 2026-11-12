@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -22,9 +23,21 @@ import httpx
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from ingest.extract import ExtractionError, extract  # noqa: E402
+from ingest.language import detect_language  # noqa: E402
+from ingest.translate import TranslationUnavailable, translate_to_english  # noqa: E402
+
 DATASET_PATH = ROOT / "data" / "dataset.jsonl"
 DEFAULT_API_URL = os.getenv("TIJORI_API_URL", "http://127.0.0.1:8000")
 DOC_TYPES = ("kyc", "loan_application", "support_ticket", "insurance_claim", "other")
+UPLOAD_TYPES = ["txt", "md", "csv", "docx", "pdf", "png", "jpg", "jpeg", "tif", "tiff"]
+TRANSLATION_BLOCKED = (
+    "Translation unavailable — refusing to send un-translated native-script text "
+    "to the gateway."
+)
 #: Same wording the evaluation harness uses, so the demo matches `reports/metrics.md`.
 #: "Do not copy the document" made qwen2.5:3b drop 9 of 10 placeholders on loan_001
 #: (the model abstracts identifiers away instead of carrying the tokens through).
@@ -66,6 +79,31 @@ def auth_headers() -> dict[str, str]:
 def short(text: str, limit: int = 80) -> str:
     text = " ".join(text.split())
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def ingest_upload(filename: str, data: bytes) -> dict:
+    """Extract, detect and translate one upload entirely on-device."""
+
+    extraction = extract(filename, data)
+    detected = detect_language(extraction.text)
+    translation = translate_to_english(extraction.text, detected)
+    return {
+        "extraction": extraction,
+        "detected": detected,
+        "translation": translation,
+    }
+
+
+def upload_identity(uploaded) -> str:
+    return f"{uploaded.file_id}:{uploaded.name}:{uploaded.size}"
+
+
+def language_badge(meta: dict | None) -> str:
+    if not meta:
+        return ""
+    if meta.get("language_code") == "en":
+        return "English — no translation needed (on-device)"
+    return f"{meta.get('language', 'Unknown')} → English, on-device"
 
 
 def leakage_findings(text: str, entities: list[dict], outbound: str) -> list[dict]:
@@ -110,6 +148,30 @@ def clear_result() -> None:
     st.session_state.pop("error", None)
 
 
+def show_upload_panel() -> None:
+    """Badge, native original, extraction metadata and translation warnings."""
+
+    meta = st.session_state.get("upload_meta")
+    if not meta:
+        return
+    st.caption(language_badge(meta))
+    with st.expander("Native original and extraction details"):
+        st.code(st.session_state.get("upload_original") or "(empty)", language="text")
+        ocr = "yes" if meta.get("ocr_used") else "no"
+        langs = f" ({', '.join(meta.get('ocr_langs') or [])})" if meta.get("ocr_langs") else ""
+        st.caption(
+            f"File: {meta.get('filename')} · pages: {meta.get('pages')} · "
+            f"OCR: {ocr}{langs} · language: {meta.get('language')} "
+            f"({meta.get('language_code')})"
+        )
+        st.caption(
+            f"Translation: {meta.get('translation_model')} · "
+            f"{meta.get('translation_ms')} ms"
+        )
+    for warning in st.session_state.get("upload_warnings") or []:
+        st.warning(warning)
+
+
 def show_result(result: dict, submitted_text: str, instruction: str) -> None:
     entities = [e for e in (result.get("entities") or []) if isinstance(e, dict)]
     outbound = result.get("outbound_payload") or ""
@@ -125,6 +187,7 @@ def show_result(result: dict, submitted_text: str, instruction: str) -> None:
             label_visibility="collapsed",
             on_change=clear_result,
         )
+        show_upload_panel()
         st.caption(
             f"{len(submitted_text)} characters · doc type: "
             f"{st.session_state.get('result_doc_type', '—')} · task: "
@@ -203,6 +266,25 @@ if "task" not in st.session_state:
 if "instruction" not in st.session_state:
     st.session_state.instruction = DEFAULT_INSTRUCTION
 
+# Upload/translation state lives in memory only. Nothing here is written to
+# disk or to the audit table.
+if "source_lang" not in st.session_state:
+    st.session_state.source_lang = "en"
+if "translation_state" not in st.session_state:
+    st.session_state.translation_state = "ok"
+if "upload_id" not in st.session_state:
+    st.session_state.upload_id = None
+if "upload_dismissed" not in st.session_state:
+    st.session_state.upload_dismissed = None
+if "upload_original" not in st.session_state:
+    st.session_state.upload_original = ""
+if "upload_meta" not in st.session_state:
+    st.session_state.upload_meta = None
+if "upload_warnings" not in st.session_state:
+    st.session_state.upload_warnings = []
+if "upload_error" not in st.session_state:
+    st.session_state.upload_error = ""
+
 with st.sidebar:
     st.subheader("Gateway")
     api_url = st.text_input("API URL", value=DEFAULT_API_URL, key="api_url").rstrip("/")
@@ -212,6 +294,68 @@ with st.sidebar:
     else:
         st.error(f"API offline at {api_url}")
 
+    st.subheader("Upload")
+    uploaded = st.file_uploader(
+        "Upload document",
+        type=UPLOAD_TYPES,
+        key="document_upload",
+        help=(
+            "Text, Markdown, CSV, DOCX, PDF or a scanned image. Extraction and "
+            "translation run on this machine; the English text is placed in the editor."
+        ),
+    )
+    if uploaded is not None:
+        identity = upload_identity(uploaded)
+        if identity != st.session_state.get("upload_id") and identity != st.session_state.get(
+            "upload_dismissed"
+        ):
+            st.session_state.upload_id = identity
+            st.session_state.translation_state = "pending"
+            st.session_state.upload_error = ""
+            st.session_state.upload_original = ""
+            st.session_state.upload_meta = None
+            st.session_state.upload_warnings = []
+            st.session_state.source_lang = "en"
+            st.session_state.pop("result", None)
+            with st.spinner("Extracting and translating on-device…"):
+                try:
+                    outcome = ingest_upload(uploaded.name, uploaded.getvalue())
+                except ExtractionError as exc:
+                    st.session_state.translation_state = "failed"
+                    st.session_state.upload_error = f"Could not read {uploaded.name}: {exc}"
+                except TranslationUnavailable as exc:
+                    st.session_state.translation_state = "failed"
+                    st.session_state.upload_error = f"{TRANSLATION_BLOCKED} {exc}"
+                except Exception as exc:  # noqa: BLE001 - never crash the demo
+                    st.session_state.translation_state = "failed"
+                    st.session_state.upload_error = (
+                        f"Could not process {uploaded.name}: {exc}"
+                    )
+                else:
+                    extraction = outcome["extraction"]
+                    detected = outcome["detected"]
+                    translation = outcome["translation"]
+                    st.session_state.original_text = translation.text
+                    st.session_state.source_lang = detected.code
+                    st.session_state.upload_original = extraction.text
+                    st.session_state.upload_meta = {
+                        "filename": extraction.filename,
+                        "pages": extraction.pages,
+                        "ocr_used": extraction.ocr_used,
+                        "ocr_langs": extraction.ocr_langs,
+                        "language": detected.script,
+                        "language_code": detected.code,
+                        "translation_model": translation.model,
+                        "translation_ms": translation.duration_ms,
+                    }
+                    st.session_state.upload_warnings = list(extraction.warnings) + list(
+                        translation.warnings
+                    )
+                    st.session_state.translation_state = "ok"
+                    st.session_state.pop("error", None)
+    if st.session_state.get("upload_error"):
+        st.error(st.session_state.upload_error)
+
     st.subheader("Document")
     if sample_by_id:
         sample_id = st.selectbox("Sample document", sorted(sample_by_id))
@@ -219,6 +363,18 @@ with st.sidebar:
             sample = sample_by_id[sample_id]
             st.session_state.original_text = sample["text"]
             st.session_state.doc_type = sample["doc_type"]
+            # Ignore the file still held by the uploader so it cannot overwrite
+            # the sample on the next rerun.
+            st.session_state.upload_dismissed = (
+                upload_identity(uploaded) if uploaded is not None else None
+            )
+            st.session_state.upload_id = None
+            st.session_state.upload_original = ""
+            st.session_state.upload_meta = None
+            st.session_state.upload_warnings = []
+            st.session_state.upload_error = ""
+            st.session_state.translation_state = "ok"
+            st.session_state.source_lang = "en"
             st.session_state.pop("result", None)
     else:
         st.caption("data/dataset.jsonl not found — using the built-in sample.")
@@ -234,14 +390,25 @@ with st.sidebar:
     )
 
     st.divider()
-    run = st.button("Run gateway", type="primary", use_container_width=True, disabled=not online)
-    st.caption("POST /v1/process on the sanitized document.")
+    translation_blocked = st.session_state.get("translation_state") in {"pending", "failed"}
+    run = st.button(
+        "Run gateway",
+        type="primary",
+        use_container_width=True,
+        disabled=not online or translation_blocked,
+    )
+    if translation_blocked:
+        st.caption("Blocked until on-device translation succeeds.")
+    else:
+        st.caption("POST /v1/process on the sanitized document.")
 
 if run:
     submitted = (st.session_state.get("original_text") or "").strip()
     instruction = (st.session_state.get("instruction") or "").strip()
     st.session_state.pop("error", None)
-    if not submitted:
+    if st.session_state.get("translation_state") == "failed":
+        st.session_state.error = TRANSLATION_BLOCKED
+    elif not submitted:
         st.session_state.error = "Enter a document before running."
     else:
         request = {
@@ -249,6 +416,7 @@ if run:
             "doc_type": st.session_state.doc_type,
             "task": st.session_state.task,
             "purpose": "general",
+            "source_lang": st.session_state.get("source_lang", "en"),
         }
         if instruction:
             request["instruction"] = instruction
@@ -305,6 +473,7 @@ with demo_tab:
                 label_visibility="collapsed",
                 on_change=clear_result,
             )
+            show_upload_panel()
         with middle:
             st.subheader("B. Outbound sanitized payload")
             st.code("Not processed yet — click Run gateway.", language="text")
@@ -338,6 +507,7 @@ with audit_tab:
                             {
                                 "time": row.get("created_at"),
                                 "doc_type": row.get("doc_type"),
+                                "language": row.get("source_lang", "en"),
                                 "entities": ", ".join(
                                     f"{key}:{value}"
                                     for key, value in (row.get("entity_counts") or {}).items()
